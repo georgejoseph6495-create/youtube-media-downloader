@@ -17,10 +17,10 @@ Your Browser
 Flask Application (http://127.0.0.1:5000)
      │
      ├── Serves Frontend UI (HTML / CSS / JavaScript)
-     ├── API Endpoints (/api/info, /api/download, /api/health)
+     ├── API Endpoints (/api/info, /api/download, /api/download/start, etc.)
      │
      ├── yt-dlp
-     │     └── Fetches media streams directly from YouTube
+     │     └── Fetches media streams from supported websites with progress hooks
      │
      └── FFmpeg / FFprobe (System PATH or project-local tools/ffmpeg/)
            ├── Merges video and audio streams into MP4
@@ -29,7 +29,21 @@ Flask Application (http://127.0.0.1:5000)
 
 - When you start the Flask application, navigate to **`http://127.0.0.1:5000`** in your browser.
 - The browser communicates with Flask via relative endpoints (`/api/...`).
-- Downloads are processed into isolated temporary folders and streamed back to your browser.
+- Real-time download progress (percentage, download speed, ETA, and size) is polled while the media is being processed.
+- Finished downloads stream directly to your browser's native download manager without buffering huge blobs in JavaScript memory.
+- Temporary files and directories are automatically cleaned up after streaming.
+
+---
+
+## Supported Output Formats & Quality Behavior
+
+- **Video (MP4)**: Merges the best available video stream and audio stream into a standard MP4 file.
+  - **Quality Options**: Up to 360p, Up to 480p, Up to 720p (Default), Up to 1080p (HD).
+  - *Quality Behavior*: Quality selection specifies the **maximum target resolution** (using `yt-dlp`'s `height<=N` filter). The application selects the best stream available up to your chosen resolution; if the source video was uploaded in a lower resolution, it picks the highest available without failing or upscaling.
+- **Audio (MP3)**: Extracts audio from the video and converts it into MP3 using FFmpeg.
+  - **Bitrate Options**: 128 kbps, 192 kbps (Default), 320 kbps (High Quality).
+
+> 💡 **Note**: Powered by `yt-dlp`, the downloader may also support video downloads from other websites compatible with yt-dlp. Support varies by website.
 
 ---
 
@@ -38,13 +52,13 @@ Flask Application (http://127.0.0.1:5000)
 ```text
 youtube-media-downloader/
 ├── backend/
-│   ├── app.py              # Flask server: serves frontend & REST API
+│   ├── app.py              # Flask server: serves frontend & REST API with progress tracking
 │   ├── requirements.txt    # Python dependencies (Flask, Flask-CORS, yt-dlp)
 │   └── downloads/          # Temporary download working directory (.gitkeep tracked)
 ├── frontend/
 │   ├── index.html          # Web UI interface
-│   ├── style.css           # Styling & responsive design
-│   └── script.js           # Frontend interactivity & API client
+│   ├── style.css           # Styling, progress bar & responsive design
+│   └── script.js           # Frontend interactivity, progress polling & direct download client
 ├── tools/
 │   └── ffmpeg/             # Directory for project-local FFmpeg binaries (.gitkeep tracked)
 ├── .gitignore              # Excludes media, caches, venvs, and FFmpeg binaries
@@ -86,7 +100,7 @@ The included `setup.ps1` script automates first-time setup for Windows environme
 3. **yt-dlp Verification**: Confirms that `yt-dlp` is ready to use.
 4. **FFmpeg Detection & Setup**:
    - First checks if `ffmpeg` and `ffprobe` are already available on your system `PATH`.
-   - If not found on `PATH` or locally, it automatically downloads an official Windows shared build directly into `tools/ffmpeg/`.
+   - If not found on `PATH` or locally, it automatically downloads a Windows FFmpeg build from the BtbN FFmpeg Builds project directly into `tools/ffmpeg/`.
    - Validates that the FFmpeg binaries are functional.
 
 ---
@@ -105,7 +119,7 @@ FFmpeg is essential for merging high-quality video and audio streams as well as 
 
 This project relies on the following open-source tools:
 
-- [**yt-dlp**](https://github.com/yt-dlp/yt-dlp): Used to extract metadata and stream video/audio from YouTube.
+- [**yt-dlp**](https://github.com/yt-dlp/yt-dlp): Used to extract metadata and download media from supported websites.
 - [**FFmpeg**](https://ffmpeg.org/): Used for multimedia stream merging and audio transcoding.
 
 ---

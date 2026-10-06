@@ -183,13 +183,10 @@ Write-Host ""
 Write-Host "============================================" -ForegroundColor DarkGray
 Write-Host "  Setup complete! Start the app:" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Terminal 1 (Backend):" -ForegroundColor White
+Write-Host "  Start the server:" -ForegroundColor White
 Write-Host "    cd backend; python app.py" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  Terminal 2 (Frontend):" -ForegroundColor White
-Write-Host "    cd frontend; python -m http.server 8080" -ForegroundColor Cyan
-Write-Host ""
 Write-Host "  Then open in your browser:" -ForegroundColor White
-Write-Host "    http://localhost:8080" -ForegroundColor Green
+Write-Host "    http://127.0.0.1:5000" -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor DarkGray
 Write-Host ""

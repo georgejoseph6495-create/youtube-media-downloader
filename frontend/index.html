@@ -9,16 +9,16 @@
 <body>
   <main class="card">
     <h1>🎬 YouTube Media Downloader</h1>
-    <p class="subtitle">Runs entirely on your machine. Paste a link, pick a format, download.</p>
+    <p class="subtitle">Runs entirely on your machine. Paste a link, pick a format, download.<br><span class="site-hint">May support other yt-dlp-compatible video websites.</span></p>
 
-    <label for="url">YouTube URL</label>
-    <input id="url" type="text" placeholder="https://www.youtube.com/watch?v=..." />
+    <label for="url">Video URL</label>
+    <input id="url" type="text" placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" />
 
     <button id="lookupBtn">Look up video</button>
 
     <div id="info" class="info hidden">
-      <img id="thumb" alt="thumbnail" />
-      <div>
+      <img id="thumb" alt="video thumbnail" loading="lazy" />
+      <div class="info-text">
         <div id="title" class="title"></div>
         <div id="meta" class="meta"></div>
       </div>
@@ -30,27 +30,37 @@
     </div>
 
     <div id="videoQuality" class="quality-row">
-      <label>Quality</label>
+      <label for="videoQualitySelect">Video Quality (Target Resolution)</label>
       <select id="videoQualitySelect">
-        <option value="360">360p</option>
-        <option value="480">480p</option>
-        <option value="720" selected>720p</option>
-        <option value="1080">1080p</option>
+        <option value="360">Up to 360p</option>
+        <option value="480">Up to 480p</option>
+        <option value="720" selected>Up to 720p (Default)</option>
+        <option value="1080">Up to 1080p (HD)</option>
       </select>
     </div>
 
     <div id="audioQuality" class="quality-row hidden">
-      <label>Bitrate</label>
+      <label for="audioQualitySelect">Audio Bitrate</label>
       <select id="audioQualitySelect">
         <option value="128">128 kbps</option>
-        <option value="192" selected>192 kbps</option>
-        <option value="320">320 kbps</option>
+        <option value="192" selected>192 kbps (Default)</option>
+        <option value="320">320 kbps (High Quality)</option>
       </select>
     </div>
 
     <button id="downloadBtn" class="primary">⬇️ Download</button>
 
-    <div id="status" class="status"></div>
+    <div id="progressContainer" class="progress-container hidden">
+      <div class="progress-bar-track">
+        <div id="progressBar" class="progress-bar-fill" style="width: 0%;"></div>
+      </div>
+      <div class="progress-info">
+        <span id="progressPhase">Preparing...</span>
+        <span id="progressStats"></span>
+      </div>
+    </div>
+
+    <div id="status" class="status" aria-live="polite"></div>
   </main>
 
   <script src="script.js"></script>

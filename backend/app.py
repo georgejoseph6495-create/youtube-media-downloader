@@ -9,9 +9,11 @@ your browser. Nothing is uploaded anywhere or served publicly.
 import os
 import re
 import shutil
+import threading
+import time
 import uuid
 
-from flask import Flask, after_this_request, jsonify, request, send_file, send_from_directory
+from flask import Flask, jsonify, request, send_file, send_from_directory
 from flask_cors import CORS
 import yt_dlp
 
@@ -21,13 +23,91 @@ DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="")
-CORS(app, expose_headers=["Content-Disposition"])  # allow the local frontend to read Content-Disposition
+CORS(app, expose_headers=["Content-Disposition"])  # allow local frontend to read Content-Disposition
 
 WINDOWS_RESERVED = {
     "CON", "PRN", "AUX", "NUL",
     "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
     "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 }
+
+# In-memory progress tracking for asynchronous browser downloads
+JOBS: dict[str, dict] = {}
+JOBS_LOCK = threading.Lock()
+
+
+def clean_error_message(err: str) -> str:
+    """Strip ANSI escape codes and redundant prefixes for clean user display."""
+    msg = str(err)
+    # Strip ANSI terminal escapes
+    msg = re.sub(r'\x1b\[[0-9;]*[mGKH]', '', msg)
+    # Strip yt-dlp ERROR prefixes
+    msg = re.sub(r'^ERROR:\s*(\[[^\]]+\]\s*)?', '', msg).strip()
+    return msg or "An unexpected error occurred."
+
+
+def format_bytes(bytes_count: int | float | None) -> str:
+    """Format byte counts into human-readable strings (e.g. 14.2 MB)."""
+    if not bytes_count or bytes_count <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB"]
+    val = float(bytes_count)
+    i = 0
+    while val >= 1024.0 and i < len(units) - 1:
+        val /= 1024.0
+        i += 1
+    return f"{val:.1f} {units[i]}"
+
+
+def safe_rmtree(path: str, retries: int = 5, delay: float = 0.2) -> None:
+    """Safely delete a directory tree with retries to handle brief Windows file locks."""
+    for _ in range(retries):
+        try:
+            shutil.rmtree(path, ignore_errors=False)
+            return
+        except Exception:
+            time.sleep(delay)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def cleanup_stale_downloads(max_age_seconds: int = 1800, force_all: bool = False) -> None:
+    """
+    Purge stale temporary download directories from downloads/ folder.
+    Preserves .gitkeep file so directory tracking remains intact in Git.
+    Guarantees active download job directories are NEVER deleted by stale cleanup.
+    """
+    now = time.time()
+    active_job_ids = set()
+    with JOBS_LOCK:
+        for j_id, j_data in JOBS.items():
+            status = j_data.get("status")
+            if status in ("starting", "downloading", "processing"):
+                active_job_ids.add(j_id)
+            elif status == "finished":
+                # Keep recently finished jobs for up to 10 minutes so users can download
+                created = j_data.get("created_at", now)
+                if now - created < 600:
+                    active_job_ids.add(j_id)
+
+    try:
+        for item in os.listdir(DOWNLOAD_DIR):
+            if item == ".gitkeep":
+                continue
+            # When cleaning up stale files during runtime, NEVER delete active jobs
+            if not force_all and item in active_job_ids:
+                continue
+            item_path = os.path.join(DOWNLOAD_DIR, item)
+            if os.path.isdir(item_path):
+                try:
+                    mtime = os.path.getmtime(item_path)
+                    if force_all or (now - mtime > max_age_seconds):
+                        safe_rmtree(item_path)
+                        with JOBS_LOCK:
+                            JOBS.pop(item, None)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def sanitize_filename(name: str, max_length: int = 120) -> str:
@@ -57,40 +137,68 @@ def sanitize_filename(name: str, max_length: int = 120) -> str:
     return name or "download"
 
 
+def validate_url(url: str) -> tuple[bool, str]:
+    """Validate user URL input before passing to yt-dlp."""
+    if not url:
+        return False, "No URL provided."
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return False, "Please enter a valid web URL starting with http:// or https://"
+    return True, ""
+
+
+def validate_mode_and_quality(mode: str, quality: str) -> tuple[str, str, str]:
+    """Validate mode and sanitize quality/bitrate parameters."""
+    if mode not in ("video", "audio"):
+        return "", "", "Invalid mode: must be 'video' or 'audio'."
+    if mode == "video":
+        height = re.sub(r'\D', '', str(quality or ""))
+        if not height or not (144 <= int(height) <= 4320):
+            height = "720"
+        return mode, height, ""
+    else:
+        bitrate = re.sub(r'\D', '', str(quality or ""))
+        if not bitrate or not (64 <= int(bitrate) <= 320):
+            bitrate = "192"
+        return mode, bitrate, ""
+
+
 # ── FFmpeg auto-detection ────────────────────────────────────────────────────
 # Priority 1: system PATH   (user already has FFmpeg installed)
 # Priority 2: project-local tools/ffmpeg/  (downloaded by setup.ps1)
-# If neither is found the app still starts, but the download endpoint will
-# return a clear error rather than a raw Python traceback.
 
 def _find_ffmpeg() -> str | None:
-    """Return the directory containing ffmpeg[.exe] and ffprobe[.exe], or None."""
+    """Return the directory containing ffmpeg and ffprobe, or None."""
     # 1. System PATH
     if shutil.which("ffmpeg") and shutil.which("ffprobe"):
         return None  # None means "let yt-dlp find it on PATH itself"
 
     # 2. Project-local tools/ffmpeg/
-    project_root = os.path.dirname(BASE_DIR)  # one level above backend/
+    project_root = os.path.dirname(BASE_DIR)
     local_dir = os.path.join(project_root, "tools", "ffmpeg")
-    local_ff  = os.path.join(local_dir, "ffmpeg.exe")
-    local_fp  = os.path.join(local_dir, "ffprobe.exe")
-    if os.path.isfile(local_ff) and os.path.isfile(local_fp):
+    has_ffmpeg = os.path.isfile(os.path.join(local_dir, "ffmpeg.exe")) or os.path.isfile(os.path.join(local_dir, "ffmpeg"))
+    has_ffprobe = os.path.isfile(os.path.join(local_dir, "ffprobe.exe")) or os.path.isfile(os.path.join(local_dir, "ffprobe"))
+    if has_ffmpeg and has_ffprobe:
         return local_dir
 
     return "NOT_FOUND"
 
 
-FFMPEG_LOCATION = _find_ffmpeg()  # None | path-string | "NOT_FOUND"
+FFMPEG_LOCATION = _find_ffmpeg()
+
+
+def get_ffmpeg_location() -> str | None:
+    """Dynamically get or re-check FFmpeg location if previously not found."""
+    global FFMPEG_LOCATION
+    if FFMPEG_LOCATION == "NOT_FOUND":
+        FFMPEG_LOCATION = _find_ffmpeg()
+    return FFMPEG_LOCATION
 
 
 # ── Startup requirement check ────────────────────────────────────────────────
 
 print("\nChecking requirements...")
-
-# Python — always available if this code is running
 print("  [OK]  Python")
 
-# yt-dlp
 try:
     import importlib.metadata as _meta
     _ytdlp_ver = _meta.version("yt-dlp")
@@ -98,7 +206,6 @@ try:
 except Exception:
     print("  [!!]  yt-dlp not found — run: pip install yt-dlp")
 
-# FFmpeg / FFprobe
 if FFMPEG_LOCATION == "NOT_FOUND":
     print("  [!!]  FFmpeg not found")
     print("  [!!]  FFprobe not found")
@@ -116,6 +223,11 @@ if FFMPEG_LOCATION == "NOT_FOUND":
 else:
     print("\n  All requirements satisfied.\n")
 
+# Clean leftover temporary download folders on server startup
+cleanup_stale_downloads(force_all=True)
+
+
+# ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
 def index():
@@ -132,11 +244,20 @@ def get_info():
     """Look up basic metadata for a URL before downloading."""
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
+    is_valid, err_msg = validate_url(url)
+    if not is_valid:
+        return jsonify({"error": err_msg}), 400
 
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True}) as ydl:
+        # Pass socket_timeout and retries to avoid hanging on slow network
+        ydl_opts = {
+            "quiet": True,
+            "noplaylist": True,
+            "socket_timeout": 15,
+            "retries": 3,
+            "extractor_retries": 3,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         return jsonify(
             {
@@ -146,41 +267,320 @@ def get_info():
                 "uploader": info.get("uploader"),
             }
         )
-    except Exception as exc:  # noqa: BLE001 - surface the real error to the UI
-        import traceback, sys
+    except yt_dlp.utils.DownloadError as exc:
+        clean_msg = clean_error_message(str(exc))
+        return jsonify({"error": clean_msg}), 400
+    except Exception as exc:
+        clean_msg = clean_error_message(str(exc))
+        return jsonify({"error": clean_msg}), 500
+
+
+def _download_worker(job_id: str, url: str, mode: str, quality: str) -> None:
+    """Background worker for asynchronous download with progress updates."""
+    job_dir = os.path.join(DOWNLOAD_DIR, job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    ffmpeg_loc = get_ffmpeg_location()
+    if ffmpeg_loc == "NOT_FOUND":
+        safe_rmtree(job_dir)
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                JOBS[job_id]["status"] = "error"
+                JOBS[job_id]["error"] = (
+                    "FFmpeg not found. Run setup.ps1 from the project root to install it automatically, "
+                    "or install FFmpeg manually and make sure it is on your PATH."
+                )
+        return
+
+    try:
+        safe_title = "download"
         try:
-            traceback.print_exc()
-        except OSError:
-            # Python 3.14 + Werkzeug reloader: stderr may be an unwritable pipe
-            print(f"[get_info] error: {exc}", file=sys.stderr, flush=False)
-        return jsonify({"error": str(exc)}), 500
+            with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True, "socket_timeout": 15}) as ydl_info:
+                info = ydl_info.extract_info(url, download=False)
+                if info and info.get("title"):
+                    safe_title = sanitize_filename(info.get("title"))
+        except Exception:
+            pass
+
+        out_template = os.path.join(job_dir, f"{safe_title}.%(ext)s")
+
+        def _progress_hook(d):
+            status = d.get("status")
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if not job:
+                    return
+                if status == "downloading":
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                    downloaded = d.get("downloaded_bytes") or 0
+                    percent = round((downloaded / total * 100), 1) if total else 0.0
+                    speed = d.get("speed")
+                    eta = d.get("eta")
+                    job["status"] = "downloading"
+                    job["percent"] = min(percent, 99.9)
+                    job["downloaded"] = format_bytes(downloaded)
+                    job["total"] = format_bytes(total) if total else "Unknown"
+                    job["speed"] = f"{format_bytes(speed)}/s" if speed else ""
+                    job["eta"] = f"{int(eta)}s" if eta and eta > 0 else ""
+                    job["phase"] = f"Downloading media ({job['percent']}%)"
+                elif status == "finished":
+                    job["status"] = "processing"
+                    job["percent"] = 99.0
+                    job["phase"] = "Processing / Merging media..."
+
+        def _postprocessor_hook(d):
+            status = d.get("status")
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                if not job:
+                    return
+                if status == "started":
+                    job["status"] = "processing"
+                    job["phase"] = "Converting / Merging with FFmpeg..."
+                elif status == "finished":
+                    job["phase"] = "Finalizing output file..."
+
+        _network_opts = {
+            "retries": 10,
+            "fragment_retries": 10,
+            "file_access_retries": 3,
+            "socket_timeout": 30,
+            "extractor_retries": 3,
+        }
+
+        if mode == "video":
+            options = {
+                "format": f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]",
+                "merge_output_format": "mp4",
+                "outtmpl": out_template,
+                "noplaylist": True,
+                "quiet": True,
+                "windowsfilenames": True,
+                "progress_hooks": [_progress_hook],
+                "postprocessor_hooks": [_postprocessor_hook],
+                **_network_opts,
+            }
+        else:
+            options = {
+                "format": "bestaudio/best",
+                "outtmpl": out_template,
+                "noplaylist": True,
+                "quiet": True,
+                "windowsfilenames": True,
+                "progress_hooks": [_progress_hook],
+                "postprocessor_hooks": [_postprocessor_hook],
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": quality,
+                    }
+                ],
+                **_network_opts,
+            }
+
+        if ffmpeg_loc is not None:
+            options["ffmpeg_location"] = ffmpeg_loc
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+
+        target_ext = ".mp4" if mode == "video" else ".mp3"
+        expected_format = "MP4" if mode == "video" else "MP3"
+
+        # Strictly select files matching the expected extension, ignoring temporary download fragments
+        files = [
+            f for f in os.listdir(job_dir)
+            if f.lower().endswith(target_ext) and not f.endswith((".part", ".ytdl"))
+        ]
+        if not files:
+            safe_rmtree(job_dir)
+            with JOBS_LOCK:
+                if job_id in JOBS:
+                    job = JOBS[job_id]
+                    job["status"] = "error"
+                    job["error"] = f"Download finished but no valid {expected_format} file was produced."
+                    job["phase"] = "Failed"
+            return
+
+        filepath = os.path.join(job_dir, files[0])
+        filename = files[0]
+
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                job = JOBS[job_id]
+                job["status"] = "finished"
+                job["percent"] = 100.0
+                job["phase"] = "Complete! Ready to download."
+                job["filepath"] = filepath
+                job["filename"] = filename
+
+        # Fallback cleanup: if file is never downloaded, purge after 10 minutes
+        def _abandoned_purge():
+            time.sleep(600)
+            safe_rmtree(job_dir)
+            with JOBS_LOCK:
+                JOBS.pop(job_id, None)
+
+        threading.Thread(target=_abandoned_purge, daemon=True).start()
+
+    except Exception as exc:
+        safe_rmtree(job_dir)
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                job = JOBS[job_id]
+                job["status"] = "error"
+                job["error"] = clean_error_message(str(exc))
+                job["phase"] = "Failed"
+
+
+@app.route("/api/download/start", methods=["POST"])
+def start_download():
+    """
+    Start an asynchronous download job with real-time progress tracking.
+    Returns a job_id for polling progress.
+    """
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    mode = data.get("mode")
+    raw_quality = data.get("quality")
+
+    is_valid, err_msg = validate_url(url)
+    if not is_valid:
+        return jsonify({"error": err_msg}), 400
+
+    mode, quality, mode_err = validate_mode_and_quality(mode, raw_quality)
+    if mode_err:
+        return jsonify({"error": mode_err}), 400
+
+    cleanup_stale_downloads(max_age_seconds=1800)
+
+    job_id = str(uuid.uuid4())
+    job_dir = os.path.join(DOWNLOAD_DIR, job_id)
+
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "starting",
+            "percent": 0.0,
+            "speed": "",
+            "eta": "",
+            "downloaded": "",
+            "total": "",
+            "phase": "Connecting to YouTube...",
+            "error": None,
+            "filepath": None,
+            "filename": None,
+            "created_at": time.time(),
+            "job_dir": job_dir,
+        }
+
+    threading.Thread(
+        target=_download_worker,
+        args=(job_id, url, mode, quality),
+        daemon=True,
+    ).start()
+
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/api/download/progress/<job_id>", methods=["GET"])
+def get_progress(job_id: str):
+    """Poll progress for an ongoing download job."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+
+        return jsonify({
+            "status": job["status"],
+            "percent": job["percent"],
+            "speed": job["speed"],
+            "eta": job["eta"],
+            "downloaded": job["downloaded"],
+            "total": job["total"],
+            "phase": job["phase"],
+            "filename": job["filename"],
+            "error": job["error"],
+        })
+
+
+@app.route("/api/download/file/<job_id>", methods=["GET"])
+def get_downloaded_file(job_id: str):
+    """
+    Stream finished file directly to browser without loading it into JavaScript memory.
+    Cleans up temporary directory once the stream closes.
+    """
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found or expired"}), 404
+        if job["status"] != "finished" or not job["filepath"]:
+            return jsonify({"error": "File is not ready yet"}), 400
+
+        filepath = job["filepath"]
+        filename = job["filename"]
+        job_dir = job["job_dir"]
+
+    # Security check: ensure filepath is inside DOWNLOAD_DIR
+    real_path = os.path.realpath(filepath)
+    real_down_dir = os.path.realpath(DOWNLOAD_DIR)
+    if not real_path.startswith(real_down_dir):
+        return jsonify({"error": "Access denied"}), 403
+
+    if not os.path.isfile(filepath):
+        return jsonify({"error": "File no longer exists"}), 404
+
+    response = send_file(filepath, as_attachment=True, download_name=filename)
+
+    @response.call_on_close
+    def cleanup_after_stream():
+        def _delayed_clean():
+            try:
+                time.sleep(1.0)
+                safe_rmtree(job_dir)
+                with JOBS_LOCK:
+                    JOBS.pop(job_id, None)
+            except Exception:
+                pass
+        threading.Thread(target=_delayed_clean, daemon=True).start()
+
+    return response
 
 
 @app.route("/api/download", methods=["POST"])
 def download():
     """
-    Download a video or audio file and return it to the browser.
-
-    Expected JSON body:
-      { "url": "...", "mode": "video" | "audio", "quality": "720" | "192" }
+    Synchronous download endpoint (preserves backwards compatibility for direct API calls).
     """
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
     mode = data.get("mode")
-    quality = str(data.get("quality") or "").strip()
+    raw_quality = data.get("quality")
 
-    if not url or mode not in ("video", "audio"):
-        return jsonify({"error": "Invalid request: need 'url' and mode 'video' or 'audio'"}), 400
+    is_valid, err_msg = validate_url(url)
+    if not is_valid:
+        return jsonify({"error": err_msg}), 400
 
-    # Each request gets its own scratch folder so concurrent downloads
-    # never collide, and cleanup is a single rmtree.
+    mode, quality, mode_err = validate_mode_and_quality(mode, raw_quality)
+    if mode_err:
+        return jsonify({"error": mode_err}), 400
+
     job_id = str(uuid.uuid4())
     job_dir = os.path.join(DOWNLOAD_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    # Guard: surface a friendly error if FFmpeg is completely missing.
-    if FFMPEG_LOCATION == "NOT_FOUND":
-        shutil.rmtree(job_dir, ignore_errors=True)
+    with JOBS_LOCK:
+        JOBS[job_id] = {
+            "status": "downloading",
+            "job_dir": job_dir,
+            "created_at": time.time(),
+        }
+
+    ffmpeg_loc = get_ffmpeg_location()
+    if ffmpeg_loc == "NOT_FOUND":
+        safe_rmtree(job_dir)
+        with JOBS_LOCK:
+            JOBS.pop(job_id, None)
         return jsonify({
             "error": (
                 "FFmpeg not found. "
@@ -190,10 +590,9 @@ def download():
         }), 500
 
     try:
-        # Pre-extract video metadata to safely sanitize title for Windows filesystem
         safe_title = "download"
         try:
-            with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True}) as ydl_info:
+            with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True, "socket_timeout": 15}) as ydl_info:
                 info = ydl_info.extract_info(url, download=False)
                 if info and info.get("title"):
                     safe_title = sanitize_filename(info.get("title"))
@@ -202,21 +601,17 @@ def download():
 
         out_template = os.path.join(job_dir, f"{safe_title}.%(ext)s")
 
-        # Network reliability settings shared by both modes.
-        # These map directly to yt-dlp's own params (verified against 2026.8.19).
-        # All values are finite — no infinite retry loops.
         _network_opts = {
-            "retries": 10,           # HTTP-level retries per fragment/request
-            "fragment_retries": 10,  # retries for individual DASH/HLS fragments
-            "file_access_retries": 3,  # retries for local file-access operations
-            "socket_timeout": 30,    # seconds before a stalled socket is closed
-            "extractor_retries": 3,  # retries for extractor-level errors
+            "retries": 10,
+            "fragment_retries": 10,
+            "file_access_retries": 3,
+            "socket_timeout": 30,
+            "extractor_retries": 3,
         }
 
         if mode == "video":
-            height = quality or "720"
             options = {
-                "format": f"bestvideo[height<={height}]+bestaudio/best[height<={height}]",
+                "format": f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]",
                 "merge_output_format": "mp4",
                 "outtmpl": out_template,
                 "noplaylist": True,
@@ -225,7 +620,6 @@ def download():
                 **_network_opts,
             }
         else:
-            bitrate = quality or "192"
             options = {
                 "format": "bestaudio/best",
                 "outtmpl": out_template,
@@ -236,28 +630,31 @@ def download():
                     {
                         "key": "FFmpegExtractAudio",
                         "preferredcodec": "mp3",
-                        "preferredquality": bitrate,
+                        "preferredquality": quality,
                     }
                 ],
                 **_network_opts,
             }
 
-        # Inject project-local FFmpeg path when yt-dlp cannot find it on PATH.
-        if FFMPEG_LOCATION is not None:
-            options["ffmpeg_location"] = FFMPEG_LOCATION
+        if ffmpeg_loc is not None:
+            options["ffmpeg_location"] = ffmpeg_loc
 
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
 
         target_ext = ".mp4" if mode == "video" else ".mp3"
-        files = [f for f in os.listdir(job_dir) if f.endswith(target_ext)]
+        expected_format = "MP4" if mode == "video" else "MP3"
+
+        # Strictly select files matching the expected extension, ignoring temporary download fragments
+        files = [
+            f for f in os.listdir(job_dir)
+            if f.lower().endswith(target_ext) and not f.endswith((".part", ".ytdl"))
+        ]
         if not files:
-            files = [f for f in os.listdir(job_dir) if not f.endswith((".part", ".ytdl"))]
-        if not files:
-            files = os.listdir(job_dir)
-        if not files:
-            shutil.rmtree(job_dir, ignore_errors=True)
-            return jsonify({"error": "Download finished but no file was produced"}), 500
+            safe_rmtree(job_dir)
+            with JOBS_LOCK:
+                JOBS.pop(job_id, None)
+            return jsonify({"error": f"Download finished but no valid {expected_format} file was produced."}), 500
 
         filepath = os.path.join(job_dir, files[0])
         filename = files[0]
@@ -266,31 +663,25 @@ def download():
 
         @response.call_on_close
         def cleanup_after_stream():
-            # Remove the temp copy once streaming finishes and file handle closes
             try:
                 if hasattr(response.response, "file") and hasattr(response.response.file, "close"):
                     response.response.file.close()
                 if hasattr(response.response, "close"):
                     response.response.close()
-                shutil.rmtree(job_dir, ignore_errors=True)
+                safe_rmtree(job_dir)
+                with JOBS_LOCK:
+                    JOBS.pop(job_id, None)
             except Exception:
                 pass
 
-        @after_this_request
-        def cleanup(resp):
-            return resp
-
         return response
 
-    except Exception as exc:  # noqa: BLE001 - surface real yt-dlp/ffmpeg errors
-        import traceback, sys
-        try:
-            traceback.print_exc()
-        except OSError:
-            # Python 3.14 + Werkzeug reloader: stderr may be an unwritable pipe
-            print(f"[download] error: {exc}", file=sys.stderr, flush=False)
-        shutil.rmtree(job_dir, ignore_errors=True)
-        return jsonify({"error": str(exc)}), 500
+    except Exception as exc:
+        safe_rmtree(job_dir)
+        with JOBS_LOCK:
+            JOBS.pop(job_id, None)
+        clean_msg = clean_error_message(str(exc))
+        return jsonify({"error": clean_msg}), 500
 
 
 if __name__ == "__main__":

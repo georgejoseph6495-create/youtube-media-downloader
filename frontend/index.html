@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>YouTube Media Downloader (Local)</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="card">
+    <h1>🎬 YouTube Media Downloader</h1>
+    <p class="subtitle">Runs entirely on your machine. Paste a link, pick a format, download.</p>
+
+    <label for="url">YouTube URL</label>
+    <input id="url" type="text" placeholder="https://www.youtube.com/watch?v=..." />
+
+    <button id="lookupBtn">Look up video</button>
+
+    <div id="info" class="info hidden">
+      <img id="thumb" alt="thumbnail" />
+      <div>
+        <div id="title" class="title"></div>
+        <div id="meta" class="meta"></div>
+      </div>
+    </div>
+
+    <div class="mode-toggle">
+      <button class="mode-btn active" data-mode="video">🎥 Video (MP4)</button>
+      <button class="mode-btn" data-mode="audio">🎵 Audio (MP3)</button>
+    </div>
+
+    <div id="videoQuality" class="quality-row">
+      <label>Quality</label>
+      <select id="videoQualitySelect">
+        <option value="360">360p</option>
+        <option value="480">480p</option>
+        <option value="720" selected>720p</option>
+        <option value="1080">1080p</option>
+      </select>
+    </div>
+
+    <div id="audioQuality" class="quality-row hidden">
+      <label>Bitrate</label>
+      <select id="audioQualitySelect">
+        <option value="128">128 kbps</option>
+        <option value="192" selected>192 kbps</option>
+        <option value="320">320 kbps</option>
+      </select>
+    </div>
+
+    <button id="downloadBtn" class="primary">⬇️ Download</button>
+
+    <div id="status" class="status"></div>
+  </main>
+
+  <script src="script.js"></script>
+</body>
+</html>

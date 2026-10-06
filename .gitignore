@@ -1,0 +1,26 @@
+# Downloaded media
+downloads/
+!backend/downloads/
+backend/downloads/*
+!backend/downloads/.gitkeep
+*.mp4
+*.mp3
+*.webm
+*.mkv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# OS/editor
+.DS_Store
+.vscode/
+
+# FFmpeg binaries downloaded by setup.ps1 (never commit these)
+tools/ffmpeg/*.exe
+tools/ffmpeg/*.dll
+# Keep the placeholder so the directory exists in git
+!tools/ffmpeg/.gitkeep
